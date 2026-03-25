@@ -1,0 +1,144 @@
+# ─────────────────────────────────────────────
+# .NET / ASP.NET Core  (api/)
+# ─────────────────────────────────────────────
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+*.rsuser
+*.pidb
+*.userprefs
+project.lock.json
+project.fragment.lock.json
+artifacts/
+**/Properties/launchSettings.json
+*.ncrunch*
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+*.log
+*.tlog
+*.ilk
+*.meta
+*.pch
+*.iobj
+*.ipdb
+*.pgc
+*.pgd
+*.rsp
+*.sbr
+*.tlb
+*.tli
+*.tlh
+*.tmp
+*.vspscc
+*.vssscc
+.builds
+*.dotCover
+*.opencover.xml
+*.coverage
+*.coveragexml
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+publish/
+PublishScripts/
+*.nupkg
+*.snupkg
+**/[Pp]ackages/
+!**/[Pp]ackages/build/
+*.nuget.props
+*.nuget.targets
+dlldata.c
+_UpgradeReport_Files/
+
+# ─────────────────────────────────────────────
+# Node.js / Angular / Ionic  (clientapp/, admin/)
+# ─────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+dist/
+tmp/
+out-tsc/
+.angular/
+.ionic/
+.capacitor/
+android/
+ios/
+www/
+.env
+.env.*
+!.env.example
+*.env.local
+
+# ─────────────────────────────────────────────
+# Docker
+# ─────────────────────────────────────────────
+.docker/
+docker-compose.override.yml
+.dockerignore
+
+# ─────────────────────────────────────────────
+# Terraform
+# ─────────────────────────────────────────────
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.lock.hcl
+
+# ─────────────────────────────────────────────
+# MongoDB (local dumps / seeds)
+# ─────────────────────────────────────────────
+*.bson
+mongodump/
+mongoexport/
+
+# ─────────────────────────────────────────────
+# Visual Studio / VS Code
+# ─────────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.history/
+*.code-workspace
+
+# ─────────────────────────────────────────────
+# OS
+# ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ─────────────────────────────────────────────
+# Secrets / credentials — never commit these
+# ─────────────────────────────────────────────
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.crt
+secrets/
+**/appsettings.*.json
+!**/appsettings.*.example.json
+google-services.json
+GoogleService-Info.plist

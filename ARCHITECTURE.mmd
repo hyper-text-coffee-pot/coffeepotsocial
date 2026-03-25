@@ -1,0 +1,99 @@
+flowchart TB
+
+    subgraph Clients["Client Layer"]
+        Web["Ionic Web / PWA\nbrowser"]
+        Android["Ionic Android App\nCapacitor"]
+        Admin["Angular Admin App\nadmin/"]
+    end
+
+    subgraph CF["Cloudflare Platform"]
+        Edge["Cloudflare Edge\nDNS · CDN · WAF · DDoS Protection\nEdge caching for static assets"]
+        R2["Cloudflare R2\nObject Storage — S3-compatible\nZero egress · Presigned PUT URLs"]
+        ImgResize["Cloudflare Image Resizing\nOn-demand URL transforms\nWebP / AVIF auto-format"]
+    end
+
+    subgraph APIGateway["API Gateway"]
+        Zuplo["Zuplo\nRate limiting · Auth enforcement\nSecurity headers · API versioning"]
+    end
+
+    subgraph BackendLayer["Backend — api/  (Docker, horizontally scaled)"]
+        ASPNET["ASP.NET Core Web API\n.NET"]
+        subgraph BGWorkers["Background Workers  IHostedService"]
+            VidWorker["VideoProcessingWorker\nFFmpeg transcoding"]
+            NotifWorker["NotificationWorker\nFCM dispatch"]
+            CleanupWorker["MediaCleanupWorker\nLifecycle GC"]
+            NewsletterWorker["NewsletterSyncWorker\nBeehiiv export"]
+        end
+    end
+
+    subgraph DataLayer["Data Layer"]
+        Mongo["MongoDB\nDigitalOcean Managed\n3-node replica set"]
+        Redis["Redis\nFeed cache · Rate counters\nFeature flags"]
+    end
+
+    subgraph FirebasePlatform["Firebase — Google"]
+        FirebaseAuth["Firebase Auth\nEmail/Password · Google · Meta OAuth"]
+        FCM["Firebase Cloud Messaging\nAndroid + PWA push notifications"]
+        GA["Google Analytics\nclient-side via Firebase SDK"]
+    end
+
+    subgraph ExternalSvcs["External Services"]
+        Sentry["Sentry\nError tracking · Performance\nAlerting · OTEL tracing"]
+        Postmark["Postmark\nTransactional email"]
+        Beehiiv["Beehiiv\nNewsletter subscriber sync"]
+        Termly["Termly\nCookie consent · Privacy policy · ToS"]
+    end
+
+    subgraph DevOps["CI/CD & Infrastructure"]
+        GitHub["GitHub\nSource control"]
+        GHActions["GitHub Actions\nLint · Test · Build · Deploy"]
+        Terraform["Terraform\nIaC — all cloud resources"]
+    end
+
+    %% ── Clients → Edge ────────────────────────────────────────────
+    Web & Android & Admin -->|HTTPS| Edge
+
+    %% ── Edge routing ──────────────────────────────────────────────
+    Edge -->|API requests| Zuplo
+    Edge <-->|Media CDN delivery| R2
+    R2 -.->|Image transform at edge| ImgResize
+
+    %% ── Gateway → API ─────────────────────────────────────────────
+    Zuplo -->|Validated + rate-limited| ASPNET
+
+    %% ── API ↔ Data ────────────────────────────────────────────────
+    ASPNET <-->|Queries / writes| Mongo
+    ASPNET <-->|Cache reads/writes| Redis
+
+    %% ── Auth ──────────────────────────────────────────────────────
+    ASPNET <-->|Validate Firebase ID tokens| FirebaseAuth
+    Web & Android <-->|Sign-in · OAuth flows| FirebaseAuth
+
+    %% ── Direct media upload (bypass API) ──────────────────────────
+    Web & Android -->|Presigned PUT upload| R2
+
+    %% ── Background workers ────────────────────────────────────────
+    VidWorker <-->|Job status| Mongo
+    VidWorker -->|Transcoded output| R2
+    NotifWorker -->|Send push message| FCM
+    FCM -->|Push notification| Android & Web
+    NewsletterWorker <-->|Mark synced| Mongo
+    NewsletterWorker -->|POST subscriber| Beehiiv
+
+    %% ── Observability ─────────────────────────────────────────────
+    ASPNET -->|Errors · traces · performance| Sentry
+
+    %% ── Transactional email ───────────────────────────────────────
+    ASPNET -->|Send email| Postmark
+
+    %% ── Analytics (client-side only) ──────────────────────────────
+    Web & Android -->|Analytics events| GA
+
+    %% ── Compliance widgets ────────────────────────────────────────
+    Termly -.->|Consent banner embedded| Web
+    Termly -.->|Consent banner embedded| Admin
+
+    %% ── CI/CD pipeline ────────────────────────────────────────────
+    GitHub -->|Triggers| GHActions
+    GHActions -->|Deploy containers| ASPNET
+    GHActions -->|Apply changes| Terraform
