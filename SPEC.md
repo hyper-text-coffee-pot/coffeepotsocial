@@ -89,6 +89,8 @@ coffeepotsocial/
 ### Discovery
 - [ ] Global/public timeline
 - [ ] Basic user search (by username)
+- [ ] `#hashtag` browse/feed (post-MVP)
+- [ ] Link preview cards on posts containing URLs (post-MVP)
 
 ### Notifications
 - [ ] In-app notifications for: likes, replies, follows, reposts, mentions
@@ -203,7 +205,9 @@ coffeepotsocial/
 | **IaC** | Terraform | Locked |
 | **Monitoring** | Sentry (errors, performance, alerting) | Locked |
 | **Compliance & consent** | Termly (privacy policy, cookie consent, ToS) | Locked |
-| **Metrics / dashboards** | DigitalOcean native monitoring + Grafana (TBD) | Open |
+| **Log aggregation** | Grafana Loki via Grafana Cloud (free tier — 50 GB/month, 14-day retention; structured logs shipped via Serilog Loki sink or OTLP exporter) | Locked |
+| **Metrics / dashboards** | Grafana Cloud free tier — Grafana dashboards + Prometheus metrics (same subscription as log aggregation; unified observability platform) | Locked |
+| **Uptime monitoring** | UptimeRobot free tier — 50 monitors, 5-minute check interval, free hosted public status page | Locked |
 | **Email (transactional)** | Postmark | Locked |
 | **Newsletter** | Beehiiv (subscriber sync via API) | Locked |
 | **Bot protection** | Google reCAPTCHA v3 (invisible, score-based) | Locked |
@@ -258,6 +262,14 @@ coffeepotsocial/
   _id: ObjectId,
   authorId: ObjectId,         // ref: users
   body: String,               // max 280 chars; nullable for media-only posts
+  hashtags: [String],         // extracted on write from #tag patterns in body; e.g. ["coffee", "tech"] — post-MVP
+  linkPreview: {              // nullable — first URL's OG metadata, fetched server-side on post create — post-MVP
+    url: String,
+    title: String,
+    description: String,
+    imageUrl: String,
+    fetchedAt: Date
+  },
   replyToId: ObjectId,        // ref: posts — nullable
   repostOfId: ObjectId,       // ref: posts — nullable
   media: [                    // embedded array (up to 4 items)
@@ -284,6 +296,7 @@ coffeepotsocial/
 //   { createdAt: -1 }                   — public timeline
 //   { replyToId: 1, createdAt: 1 }     — reply threads
 //   text index on { body }             — full-text post search
+//   { hashtags: 1 }                    — hashtag browse/search (post-MVP)
 ```
 
 ### Collection: `media`
@@ -510,7 +523,10 @@ DELETE /api/v1/me/fcm-token                 — unregister FCM token (on logout 
 ```
 GET    /api/v1/search/users?q=              — search users by username / display name
 GET    /api/v1/search/posts?q=              — full-text search over posts
+GET    /api/v1/search/hashtags/:tag         — browse posts by hashtag (post-MVP)
 ```
+
+> **Implementation note:** Full-text post search uses MongoDB's `$text` operator against the text index on `posts.body` (defined in §6) — no additional search infrastructure required for MVP. Results are sorted by relevance score (`{ score: { $meta: "textScore" } }`). Hashtag search (post-MVP) queries `{ hashtags: "tag" }` using the `hashtags` array index.
 
 ### Reports
 ```
@@ -887,7 +903,7 @@ A production system that isn't observable is a system you can't operate. Observa
 - Log levels: `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`
 - Every request logged with: `requestId`, `userId` (if authenticated), `method`, `path`, `statusCode`, `durationMs`
 - Sentry captures errors and exceptions with full stack traces and request context automatically
-- Logs aggregator TBD (DigitalOcean built-in log forwarding likely sufficient for MVP)
+- Logs aggregated to **Grafana Loki** via **Grafana Cloud** (free tier — 50 GB/month, 14-day retention). Structured JSON logs are shipped from ASP.NET Core via the Serilog Grafana Loki sink or the OpenTelemetry log exporter to Grafana Cloud's OTLP endpoint. Integrates directly with the Grafana dashboards used for metrics — one platform for logs, metrics, and traces.
 - **Never log:** passwords, tokens, full OAuth credentials, PII beyond userId
 
 #### 2. Metrics
@@ -935,8 +951,8 @@ GET /readyz            — readiness probe (is the app ready to serve traffic?)
 
 ### Uptime Monitoring
 
-- External uptime checks from at least 2 geographic regions (e.g. BetterStack, UptimeRobot)
-- Public status page (e.g. [status.coffeepotsocial.com](https://status.coffeepotsocial.com)) — automated updates on incidents
+- External uptime checks via **UptimeRobot** (free tier — 50 monitors, 5-minute check interval, checks from 2 geographic regions, email alerting on downtime)
+- Public status page at **status.coffeepotsocial.com** powered by UptimeRobot's free hosted status page — no additional tooling required
 - SLA targets tracked per calendar month
 
 ---
@@ -1207,6 +1223,8 @@ Services brought up locally:
 
 > **R2 in local dev:** MinIO fully emulates R2's S3-compatible API — presigned URLs, bucket operations, and AWS SDK calls all work identically. Configure the AWS SDK to point at `http://localhost:9000` locally and `https://<account>.r2.cloudflarestorage.com` in production. Cloudflare Image Resizing has no local emulator; during local dev, serve images directly from MinIO without transforms, and test resizing against the real CF CDN in a staging environment.
 
+> **Firebase in local dev:** The [Firebase Emulator Suite](https://firebase.google.com/docs/emulator-suite) provides local emulators for Firebase Auth (`localhost:9099`) and FCM (`localhost:8085`). Configure the Firebase Admin SDK to target the emulator host in `local` and `test` environments (via `FIREBASE_AUTH_EMULATOR_HOST` environment variable). This enables auth testing — token expiry, suspended users, provider linking — without hitting production Firebase services or consuming real quota.
+
 Seed data script (dotnet run --project tools/seed) to populate local DB with test users, posts, follows.
 
 ---
@@ -1471,6 +1489,8 @@ Additional privacy practices:
 - [x] ~~JWT (stateless) or server-side sessions~~ → Firebase ID tokens (JWTs) verified statelessly; no session storage needed
 
 ### Product Decisions
+- [ ] Hashtags (`#tags`) — extract on write, index for browse/feed; planned post-MVP
+- [ ] Link preview cards (OG metadata unfurling) — server-side URL fetch on post create, cached in Redis; requires URL allowlist to prevent SSRF (OWASP A10); planned post-MVP
 - [ ] What do we call a post? ("Brew"? "Pour"? just "post"?)
 - [ ] Character limit — 280 to match convention, or something distinct?
 - [ ] Private accounts in MVP or post-MVP?
@@ -1485,13 +1505,13 @@ Additional privacy practices:
 - [x] ~~Compliance & consent~~ → Termly
 - [ ] DigitalOcean App Platform vs. Kubernetes vs. raw Droplets for container orchestration? (decision can wait until after MVP is running)
 - [x] ~~Monitoring stack~~ → Sentry for errors/tracing; DigitalOcean native monitoring for infra metrics
-- [ ] Metrics dashboard: DigitalOcean native sufficient, or add Grafana?
+- [x] ~~Metrics dashboard~~ → Grafana Cloud free tier — unified logs (Loki), metrics (Prometheus), and dashboards in one platform
 - [x] ~~Email provider~~ → Postmark (transactional email)
 - [x] ~~Newsletter provider~~ → Beehiiv
 
 ### Operational Decisions
 - [ ] On-call rotation policy? (Who gets paged, and when?)
-- [ ] Public status page tooling? (Instatus, Betterstack, self-hosted?)
+- [x] ~~Public status page tooling~~ → UptimeRobot free hosted status page at status.coffeepotsocial.com
 - [ ] Backup testing cadence?
 
 ---

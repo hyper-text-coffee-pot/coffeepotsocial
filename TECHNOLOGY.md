@@ -10,7 +10,7 @@
 - **Docker + Docker Compose** — containerised, local dev parity
 
 ## Data
-- **MongoDB** — primary database, DigitalOcean managed (3-node replica set)
+- **MongoDB** — primary database, DigitalOcean managed (3-node replica set); built-in text indexes for full-text post search
 - **Redis** — feed cache, rate limit counters, feature flags
 
 ## Cloud & Infrastructure
@@ -29,10 +29,13 @@
 ## CI/CD & DevOps
 - **GitHub + GitHub Actions** — source control, full CI/CD pipeline
 - **CodeQL · Semgrep · Gitleaks** — automated security scanning in CI
+- **Firebase Emulator Suite** — local Auth and FCM emulation for development and testing
+- **MinIO** — local S3-compatible storage emulating Cloudflare R2
 
 ## Observability
 - **Sentry** — error tracking, performance monitoring, OTEL tracing
-- **Grafana** — metrics dashboards (Prometheus-compatible)
+- **Grafana Cloud** (free tier) — unified observability: Loki (log aggregation), Prometheus metrics, Grafana dashboards
+- **UptimeRobot** (free tier) — external uptime monitoring, public status page at status.coffeepotsocial.com
 
 ## External Services
 - **Postmark** — transactional email
