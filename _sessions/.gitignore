@@ -1,0 +1,5 @@
+# Ignore all but the .include file in this directory
+*
+!.include
+!.gitignore
+!.git

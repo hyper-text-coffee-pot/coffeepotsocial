@@ -14,11 +14,12 @@
 - **Redis** — feed cache, rate limit counters, feature flags
 
 ## Cloud & Infrastructure
-- **DigitalOcean** — managed MongoDB, hosted containers (App Platform or Kubernetes TBD)
+- **DigitalOcean App Platform** — MVP hosting: free static sites (clientapp, admin), Docker container service for API (~$12/mo); DOKS (managed Kubernetes) post-MVP migration path
+- **DigitalOcean** — managed MongoDB cluster
 - **Cloudflare** — DNS, DDoS/WAF, CDN, edge caching
 - **Cloudflare R2** — object/media storage (S3-compatible, zero egress)
 - **Cloudflare Image Resizing** — on-demand image transforms (WebP/AVIF)
-- **Terraform** — infrastructure as code for all cloud resources
+- **Terraform** — infrastructure as code for all manageable cloud resources (`infra/`); providers: `digitalocean`, `cloudflare`, `grafana`, `sentry`
 
 ## API & Auth
 - **Zuplo** — API gateway (rate limiting, auth enforcement, security headers, versioning)
