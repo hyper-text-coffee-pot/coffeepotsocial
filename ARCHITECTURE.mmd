@@ -16,7 +16,7 @@ flowchart TB
         Zuplo["Zuplo\nRate limiting · Auth enforcement\nSecurity headers · API versioning"]
     end
 
-    subgraph BackendLayer["Backend — api/  (Docker, horizontally scaled)"]
+    subgraph BackendLayer["Backend — api/  (DigitalOcean App Platform · Docker · MVP)"]
         ASPNET["ASP.NET Core Web API\n.NET"]
         subgraph BGWorkers["Background Workers  IHostedService"]
             VidWorker["VideoProcessingWorker\nFFmpeg transcoding"]
@@ -52,7 +52,8 @@ flowchart TB
     subgraph DevOps["CI/CD & Infrastructure"]
         GitHub["GitHub\nSource control"]
         GHActions["GitHub Actions\nLint · Test · Build · Deploy\nCodeQL · Semgrep · Gitleaks"]
-        Terraform["Terraform\nIaC — all cloud resources"]
+        Terraform["Terraform  infra/\nProviders: digitalocean · cloudflare · grafana · sentry\nManages: App Platform · MongoDB · Redis · DNS · R2 · WAF · dashboards\nNot managed: Firebase · Zuplo · Postmark · Beehiiv"]
+        AppPlatform["DigitalOcean App Platform\nMVP hosting · Managed TLS\nLog forwarding · 10-rev rollback"]
     end
 
     %% ── Clients → Edge ────────────────────────────────────────────
@@ -107,5 +108,6 @@ flowchart TB
 
     %% ── CI/CD pipeline ────────────────────────────────────────────
     GitHub -->|Triggers| GHActions
-    GHActions -->|Deploy containers| ASPNET
+    GHActions -->|Push Docker image| AppPlatform
+    AppPlatform -->|Runs container| ASPNET
     GHActions -->|Apply changes| Terraform

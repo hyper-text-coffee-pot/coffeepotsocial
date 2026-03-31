@@ -1,4 +1,4 @@
-# CoffeePotSocial — Project Specification
+﻿# CoffeePotSocial — Project Specification
 
 > Living document. Updated as decisions are made.
 
@@ -38,6 +38,12 @@ coffeepotsocial/
 ├── clientapp/      — Ionic + Angular: mobile & web client (Android, PWA)
 ├── admin/          — Angular standalone: internal admin & moderation dashboard
 ├── api/            — ASP.NET Core Web API: backend REST API
+├── infra/          — Terraform: all cloud infrastructure as code
+│   ├── main.tf
+│   ├── variables.tf
+│   ├── outputs.tf
+│   ├── providers.tf
+│   └── modules/    — reusable resource modules (app, database, dns, storage, monitoring)
 ├── actions/        — GitHub Actions workflow definitions
 ├── _changelogs/    — Release changelogs
 ├── SPEC.md         — This document
@@ -172,7 +178,8 @@ coffeepotsocial/
 | **Async work** | In-process background tasks (`IHostedService`) for MVP; DigitalOcean Managed Kafka if workload demands a queue post-MVP | Simple to start; Kafka available on DO if needed |
 | **Object storage** | Cloudflare R2 (S3-compatible, zero egress) | All media in one store; S3 presigned PUT URLs; zero egress fees; Cloudflare CDN built-in; Cloudflare Stream available post-MVP for video |
 | **Real-time** | Polling for MVP → SSE/WebSockets post-MVP | Capacitor supports native WebSocket; SSE fine for web |
-| **Orchestration** | DigitalOcean App Platform or Kubernetes \u2014 TBD | App Platform is simpler; Kubernetes gives more control; decide after MVP |
+| **Orchestration (MVP)** | DigitalOcean App Platform | Monolith-first Docker container fits App Platform perfectly; static frontends are free; managed TLS, log forwarding, and 10-revision rollback built in; ~$27/mo vs ~$51/mo for DOKS at MVP scale; same Docker images migrate to DOKS later with no app changes |
+| **Orchestration (post-MVP)** | DOKS (DigitalOcean Managed Kubernetes) | Migrate when workers are extracted to separate containers and finer-grained scheduling or scaling is needed; DO control plane is free; K8s expertise is transferable |
 
 ---
 
@@ -201,7 +208,7 @@ coffeepotsocial/
 | **Source control** | GitHub | Locked |
 | **CI/CD** | GitHub Actions | Locked |
 | **Containerisation** | Docker + Docker Compose | Locked |
-| **Orchestration (production)** | DigitalOcean App Platform vs. Kubernetes — TBD | Open |
+| **Orchestration (production)** | DigitalOcean App Platform (MVP) — static sites free; API as a service component; managed TLS, log forwarding, 10-revision rollback. DOKS post-MVP when worker extraction demands it. | Locked |
 | **IaC** | Terraform | Locked |
 | **Monitoring** | Sentry (errors, performance, alerting) | Locked |
 | **Compliance & consent** | Termly (privacy policy, cookie consent, ToS) | Locked |
@@ -1067,13 +1074,128 @@ No premature optimisation — the DO managed cluster handles replication, failov
 | Component | Approach |
 |---|---|
 | **Containerisation** | Docker for all services |
-| **Orchestration** | Docker Compose for local dev; DigitalOcean App Platform or Kubernetes for production (TBD) |
-| **IaC** | Terraform — all cloud infrastructure (DO resources, DNS, Cloudflare) defined as code from day one |
-| **Environments** | `local` → `staging` → `production` — each environment has its own Terraform workspace |
+| **Orchestration** | Docker Compose for local dev; DigitalOcean App Platform for production (MVP); DOKS post-MVP |
+| **IaC** | Terraform — all manageable cloud infrastructure defined as code from day one; see Terraform IaC subsection below for full provider list and scope |
+| **Environments** | `local` → `staging` → `production` — each has its own Terraform workspace and `tfvars` file |
 | **CI/CD** | GitHub Actions (see §12a below for full pipeline detail) |
 | **Database** | DigitalOcean managed MongoDB cluster (handles replication, backups, failover) |
-| **Secrets management** | Environment variables via `.env` locally; DigitalOcean App Platform secrets or DO Vault in production; Terraform state stored in remote backend (Cloudflare R2) with encryption. **Note:** R2 does not support DynamoDB-style state locking — concurrent `terraform apply` runs (e.g. two CI pipelines) can corrupt state. Mitigate by serialising Terraform runs in CI (one job at a time) or using a separate locking mechanism (e.g. a small DynamoDB table or Terraform Cloud for state management). |
+| **Secrets management** | Environment variables via `.env` locally; DigitalOcean App Platform secrets in production; Terraform state in Cloudflare R2 remote backend (see Terraform IaC subsection for state locking detail) |
 | **Backups** | Automated daily snapshots via DO managed DB; tested restore procedure; retention: 30 days |
+
+### Terraform IaC
+
+All cloud infrastructure is defined in Terraform from day one. No resources are provisioned manually through cloud consoles — if it exists in production, it exists in `infra/`. This ensures environments are reproducible, diffs are reviewable, and infrastructure changes go through the same PR process as application code.
+
+#### Terraform Providers
+
+```hcl
+terraform {
+  required_providers {
+    digitalocean = {
+      source  = "digitalocean/digitalocean"  # App Platform, managed MongoDB, managed Redis, DO DNS
+    }
+    cloudflare = {
+      source  = "cloudflare/cloudflare"      # DNS zones, R2 buckets, WAF rules, page rules
+    }
+    grafana = {
+      source  = "grafana/grafana"            # Grafana Cloud dashboards, Loki data sources, alert rules
+    }
+    sentry = {
+      source  = "jianyuan/sentry"            # Sentry projects, alert rules, team configuration
+    }
+  }
+}
+```
+
+#### What Terraform Manages
+
+| Resource | Provider | Notes |
+|---|---|---|
+| DO App Platform (API service + static sites) | `digitalocean` | `digitalocean_app` resource — full service spec, env vars, scaling |
+| DO Managed MongoDB cluster | `digitalocean` | Cluster size, replica count, firewall rules |
+| DO Managed Redis | `digitalocean` | Instance size, eviction policy |
+| Cloudflare DNS zones + records | `cloudflare` | All DNS records for all environments |
+| Cloudflare R2 buckets | `cloudflare` | `cloudflare_r2_bucket` — one per environment |
+| Cloudflare WAF / page rules | `cloudflare` | Rate limiting rules, cache rules |
+| Grafana Cloud dashboards | `grafana` | Dashboard JSON, Loki data source, Prometheus data source |
+| Grafana alert rules | `grafana` | Alert thresholds, notification channels |
+| Sentry projects | `sentry` | One project per app component (api, clientapp, admin) |
+| Sentry alert rules | `sentry` | Error rate thresholds, performance alerts |
+
+#### What Terraform Does NOT Manage
+
+These external SaaS services have no usable Terraform provider and are configured manually or via their own APIs:
+
+| Service | Reason | How Configured |
+|---|---|---|
+| Firebase Auth | Google's Firebase TF provider covers project setup only; Auth rules, OAuth providers, and email templates are console/SDK managed | Firebase Console + `firebase.json` in repo |
+| Zuplo | No published Terraform provider | Zuplo dashboard + policy files committed to repo |
+| Postmark | No provider — credentials only | Secret injected via GitHub Actions / App Platform env vars |
+| Beehiiv | No provider | API key stored as secret; no infrastructure to provision |
+| UptimeRobot | Community provider exists but is unmaintained; not worth the risk | UptimeRobot dashboard |
+| Termly | No provider — embed script only | Script tag in app HTML |
+
+> **Rule:** anything not in Terraform must have its configuration documented here or in a runbook. "It's in the console" is not acceptable for production resources.
+
+#### Workspace Strategy
+
+Three Terraform workspaces map to three environments:
+
+```
+terraform workspace select local       # local dev (rarely used — docker compose handles local)
+terraform workspace select staging     # staging environment on DO
+terraform workspace select production  # production environment on DO
+```
+
+Each workspace uses environment-specific `tfvars` files (`staging.tfvars`, `production.tfvars`) committed to `infra/` (secrets excluded — injected via CI).
+
+#### State Backend
+
+Terraform state is stored remotely in a **Cloudflare R2 bucket** using the S3-compatible backend:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket                      = "coffeepotsocial-tfstate"
+    key                         = "terraform.tfstate"
+    region                      = "auto"
+    endpoint                    = "https://<account>.r2.cloudflarestorage.com"
+    skip_credentials_validation = true
+    skip_metadata_api_check     = true
+    skip_region_validation      = true
+    force_path_style            = true
+  }
+}
+```
+
+> **State locking caveat:** R2 does not support DynamoDB-style state locking. Concurrent `terraform apply` runs will corrupt state. Mitigate by serialising Terraform runs in CI — the `terraform.yml` workflow uses `concurrency: group: terraform` to enforce this.
+
+### App Platform — MVP Deployment Architecture
+
+DigitalOcean App Platform is the production hosting target for MVP. It runs Docker containers without requiring Kubernetes expertise, and handles TLS, log forwarding, and rollback out of the box.
+
+**Service components on App Platform:**
+
+| Component | App Platform Type | Cost |
+|---|---|---|
+| `clientapp/` (Ionic Angular web/PWA) | Static site | Free |
+| `admin/` (Angular admin dashboard) | Static site | Free |
+| `api/` (ASP.NET Core API + embedded workers) | Service (Docker container) | ~$12/mo (1 vCPU / 1 GB) |
+| Redis | Managed database add-on | ~$15/mo |
+| **Total (excl. MongoDB, Cloudflare)** | | **~$27/mo** |
+
+**Key App Platform features used:**
+
+- **Log forwarding** — structured JSON logs forwarded to Grafana Loki (Grafana Cloud) via App Platform's built-in log drain
+- **10-revision rollback** — matches the rollback strategy in §12a; re-point to a prior image digest without a redeploy
+- **Managed TLS** — automatic HTTPS certificate provisioning and renewal; no cert-manager required
+- **Environment variables / secrets** — injected at runtime via App Platform's secret management UI and Terraform; never in source control
+- **Horizontal scaling** — add instances via Terraform or the DO console; no Kubernetes manifests needed
+
+**IaC:** App Platform is fully managed via the `digitalocean_app` Terraform resource — all components, environment variables, and scaling settings are defined in code.
+
+**Post-MVP migration to DOKS:**
+When background workers are extracted to separate containers (e.g. `VideoProcessingWorker` as its own service), DOKS becomes the natural next step. The migration is low-risk: the same Docker images deploy unchanged — only the Terraform deploy target and GitHub Actions deploy step change. No application code changes required.
 
 ---
 
@@ -1503,8 +1625,8 @@ Additional privacy practices:
 - [x] ~~Object storage~~ → Cloudflare R2 (S3-compatible, zero egress, native Cloudflare CDN)
 - [x] ~~CDN~~ → Cloudflare
 - [x] ~~Compliance & consent~~ → Termly
-- [ ] DigitalOcean App Platform vs. Kubernetes vs. raw Droplets for container orchestration? (decision can wait until after MVP is running)
-- [x] ~~Monitoring stack~~ → Sentry for errors/tracing; DigitalOcean native monitoring for infra metrics
+- [x] ~~Container orchestration~~ → DigitalOcean App Platform for MVP (~$27/mo total); DOKS post-MVP when worker extraction and finer scaling control justify it
+- [x] ~~Monitoring stack~~ → Sentry for errors/tracing; Grafana Cloud for logs (Loki) and metrics
 - [x] ~~Metrics dashboard~~ → Grafana Cloud free tier — unified logs (Loki), metrics (Prometheus), and dashboards in one platform
 - [x] ~~Email provider~~ → Postmark (transactional email)
 - [x] ~~Newsletter provider~~ → Beehiiv
