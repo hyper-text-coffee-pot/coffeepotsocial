@@ -227,7 +227,7 @@ coffeepotsocial/
   followerCount: Number,      // denormalised counter
   followingCount: Number,     // denormalised counter
   fcmTokens: [String],        // FCM device tokens for push notifications (array for multi-device)
-  newsletterOptIn: Boolean,   // true if user opted in on signup (checkbox pre-checked); default: true
+  newsletterOptIn: Boolean,   // true if user explicitly opted in on signup (checkbox unchecked by default); default: false
   newsletterSynced: Boolean,  // false until exported to newsletter API by sync worker; default: false
   createdAt: Date,
   updatedAt: Date
@@ -324,6 +324,20 @@ coffeepotsocial/
 //   { postId: 1 }              — like counts / who liked a post
 ```
 
+### Collection: `reposts`
+```js
+{
+  _id: ObjectId,
+  userId: ObjectId,           // ref: users
+  postId: ObjectId,           // ref: posts
+  createdAt: Date
+}
+
+// Indexes:
+//   { userId: 1, postId: 1 }  unique  — enforces one repost per user per post; supports undo repost
+//   { postId: 1 }              — repost counts / who reposted a post
+```
+
 ### Collection: `notifications`
 ```js
 {
@@ -412,8 +426,9 @@ POST   /api/v1/auth/unlink/:provider        — unlink a provider from the Fireb
 
 ### Users
 ```
-GET    /api/v1/users/:username              — public profile
+GET    /api/v1/users/me                     — authenticated user's own profile (includes private fields)
 PATCH  /api/v1/users/me                     — update own profile
+GET    /api/v1/users/:username              — public profile
 GET    /api/v1/users/:username/posts        — user's posts (paginated)
 GET    /api/v1/users/:username/followers    — follower list
 GET    /api/v1/users/:username/following    — following list
@@ -555,7 +570,8 @@ All authentication is handled by **Firebase Auth** — we do not implement our o
 | Google Sign-In | Google (via Firebase) | Standard OAuth, managed by Firebase |
 | Facebook Sign-In | Meta (via Firebase) | Requires Meta app registration |
 
-> **Apple Sign-In is not supported.** Required for iOS App Store submission but not in scope — no Apple Developer account. Android and web-only for now.
+> **Apple Sign-In is not supported for MVP.** Android and web-only for now — no Apple Developer account.
+> **Important for future iOS App Store submission:** Apple's App Store Review Guidelines (Guideline 4.8) require that any app offering third-party social login (Google, Facebook, etc.) must also offer Sign In with Apple. When iOS is targeted post-MVP, Sign In with Apple must be added via Firebase Auth before App Store submission.
 
 ### Firebase User ↔ MongoDB User Mapping
 
@@ -661,7 +677,7 @@ Images are **not processed in-process**. After upload to R2, Cloudflare Image Re
 
 - **Validation (pre-upload):** verify file magic bytes on the server before issuing the presigned URL; reject if not JPEG/PNG/WebP/GIF; enforce 20MB max
 - **Safety scan:** optional perceptual hash check against known CSAM databases before issuing the upload URL
-- **EXIF strip:** strip EXIF metadata server-side before upload (or as a lightweight pre-process step); R2 does not strip automatically unlike Cloudflare Images
+- **EXIF strip:** strip EXIF metadata **client-side before upload** (e.g. using a canvas re-encode in the Ionic app) or as a **post-upload worker step** that re-writes the object in R2; server-side stripping before upload is not possible because the file goes directly from the client to R2 via presigned URL, bypassing the API server. R2 does not strip automatically unlike Cloudflare Images
 - **Resizing & format:** handled at CDN delivery time via URL query parameters:
   - Avatar large: `?width=400&height=400&fit=cover&format=webp`
   - Avatar small: `?width=100&height=100&fit=cover&format=webp`
@@ -762,15 +778,37 @@ Push notifications are delivered via **Firebase Cloud Messaging (FCM)** to Andro
 
 ---
 
+## 9b. Analytics (Google Analytics)
+
+Google Analytics is integrated client-side in the Ionic app via the **Firebase SDK** (GA is part of the Firebase suite).
+
+### What We Track
+- Screen views / page navigation
+- Key events: `sign_up`, `login`, `post_created`, `post_liked`, `user_followed`
+- Retention and engagement metrics (DAU/MAU)
+- Traffic sources for web version
+
+### What We Do Not Track
+- Post content
+- Private user data
+- Any data that would conflict with GDPR/privacy obligations
+
+### Implementation Notes
+- Analytics initialised once in the Ionic Angular app module via `AngularFireAnalytics` (or `firebase/analytics`)
+- Event calls are fire-and-forget — never block user interactions
+- Analytics is **disabled in local/development environment** to avoid polluting production data
+
 ---
 
 ## 9c. Newsletter Opt-In & Sync
 
-On signup, users are offered the option to join the CoffeePotSocial newsletter. The checkbox is **pre-checked** — users must actively uncheck to opt out.
+On signup, users are offered the option to join the CoffeePotSocial newsletter. The checkbox is **unchecked by default** — users must actively check it to opt in.
+
+> **GDPR compliance:** GDPR Recital 32 explicitly prohibits pre-ticked consent boxes for marketing communications. Consent must be freely given, specific, informed, and unambiguous. Pre-checked opt-in is not valid consent under GDPR.
 
 ### Signup UI
 - Checkbox label: *"Also add me to the Coffee Pot Newsletter"*
-- Pre-checked: `true`
+- Default: **unchecked** — affirmative opt-in required
 - Value posted to our API along with the rest of the registration payload and stored as `newsletterOptIn: true/false` on the `users` document
 - Only shown on email/password and social sign-up flows (not on subsequent logins)
 
@@ -797,32 +835,8 @@ On signup, users are offered the option to join the CoffeePotSocial newsletter. 
 - `newsletterSynced: true` is set once Beehiiv confirms the subscription (HTTP 200/201)
 - The `newsletterSynced` flag makes the sync idempotent — safe to re-run without double-subscribing
 - User emails are never shared externally beyond the newsletter provider
-- Opt-out must be available in account settings (GDPR requirement for pre-checked consent)
+- Opt-out must be available in account settings at any time (GDPR requirement)
 - The sync worker is lightweight and low-frequency; no dedicated infrastructure needed
-
----
-
-## 9b. Analytics (Google Analytics)
-
-Google Analytics is integrated client-side in the Ionic app via the **Firebase SDK** (GA is part of the Firebase suite).
-
-### What We Track
-- Screen views / page navigation
-- Key events: `sign_up`, `login`, `post_created`, `post_liked`, `user_followed`
-- Retention and engagement metrics (DAU/MAU)
-- Traffic sources for web version
-
-### What We Do Not Track
-- Post content
-- Private user data
-- Any data that would conflict with GDPR/privacy obligations
-
-### Implementation Notes
-- Analytics initialised once in the Ionic Angular app module via `AngularFireAnalytics` (or `firebase/analytics`)
-- Event calls are fire-and-forget — never block user interactions
-- Analytics is **disabled in local/development environment** to avoid polluting production data
-
----
 
 ---
 
@@ -981,12 +995,14 @@ No premature optimisation — the DO managed cluster handles replication, failov
 
 | Cached Data | TTL | Invalidation |
 |---|---|---|
-| User session | 7 days (rolling) | Explicit logout / admin revoke |
+| Firebase UID → User document lookup | 5 minutes | On profile update / suspension change |
 | Public timeline feed | 30 seconds | TTL expiry |
 | User profile (public) | 5 minutes | On profile update |
 | Post data | 5 minutes | On post delete |
 | Rate limit counters | Per window (60s) | TTL expiry |
 | Feature flags | 60 seconds | On update |
+
+> **Note:** There are no server-side sessions — Firebase ID tokens are verified statelessly (see §8). Redis is not used for session storage. The UID → User lookup cache above is an optional performance optimisation to avoid a MongoDB lookup on every request.
 
 ### Queue & Worker Scaling
 
@@ -1004,7 +1020,7 @@ No premature optimisation — the DO managed cluster handles replication, failov
 | **Environments** | `local` → `staging` → `production` — each environment has its own Terraform workspace |
 | **CI/CD** | GitHub Actions: lint → test → build → deploy to staging on PR merge; promote to production manually |
 | **Database** | DigitalOcean managed MongoDB cluster (handles replication, backups, failover) |
-| **Secrets management** | Environment variables via `.env` locally; DigitalOcean App Platform secrets or DO Vault in production; Terraform state stored in remote backend (Cloudflare R2) with encryption |
+| **Secrets management** | Environment variables via `.env` locally; DigitalOcean App Platform secrets or DO Vault in production; Terraform state stored in remote backend (Cloudflare R2) with encryption. **Note:** R2 does not support DynamoDB-style state locking — concurrent `terraform apply` runs (e.g. two CI pipelines) can corrupt state. Mitigate by serialising Terraform runs in CI (one job at a time) or using a separate locking mechanism (e.g. a small DynamoDB table or Terraform Cloud for state management). |
 | **Backups** | Automated daily snapshots via DO managed DB; tested restore procedure; retention: 30 days |
 
 ### Local Development
@@ -1140,6 +1156,7 @@ Additional privacy practices:
 - [ ] Private accounts in MVP or post-MVP?
 - [ ] Quote-post in MVP or post-MVP?
 - [ ] Should we support ActivityPub / Fediverse compatibility (long-term goal)?
+- [ ] Add Sign In with Apple (required by App Store before any iOS submission — Firebase Auth supports it)
 
 ### Infrastructure Decisions
 - [x] ~~Hosting provider~~ → DigitalOcean
