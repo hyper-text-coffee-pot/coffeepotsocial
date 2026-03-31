@@ -18,6 +18,7 @@
 10. [Monitoring & Observability](#10-monitoring--observability)
 11. [Admin Tooling](#11-admin-tooling)
 12. [Scalability & Infrastructure](#12-scalability--infrastructure)
+    - [12a. CI/CD Pipeline (GitHub Actions)](#12a-cicd-pipeline-github-actions)
 13. [Security](#13-security)
 14. [Non-Functional Requirements](#14-non-functional-requirements)
 15. [Open Questions](#15-open-questions)
@@ -88,9 +89,12 @@ coffeepotsocial/
 ### Discovery
 - [ ] Global/public timeline
 - [ ] Basic user search (by username)
+- [ ] `#hashtag` browse/feed (post-MVP)
+- [ ] Link preview cards on posts containing URLs (post-MVP)
 
 ### Notifications
-- [ ] In-app notifications for: likes, replies, follows, reposts
+- [ ] In-app notifications for: likes, replies, follows, reposts, mentions
+- [ ] `@username` mention parsing in post body (post-MVP: dedicated mentions feed)
 
 ---
 
@@ -201,9 +205,12 @@ coffeepotsocial/
 | **IaC** | Terraform | Locked |
 | **Monitoring** | Sentry (errors, performance, alerting) | Locked |
 | **Compliance & consent** | Termly (privacy policy, cookie consent, ToS) | Locked |
-| **Metrics / dashboards** | DigitalOcean native monitoring + Grafana (TBD) | Open |
+| **Log aggregation** | Grafana Loki via Grafana Cloud (free tier — 50 GB/month, 14-day retention; structured logs shipped via Serilog Loki sink or OTLP exporter) | Locked |
+| **Metrics / dashboards** | Grafana Cloud free tier — Grafana dashboards + Prometheus metrics (same subscription as log aggregation; unified observability platform) | Locked |
+| **Uptime monitoring** | UptimeRobot free tier — 50 monitors, 5-minute check interval, free hosted public status page | Locked |
 | **Email (transactional)** | Postmark | Locked |
 | **Newsletter** | Beehiiv (subscriber sync via API) | Locked |
+| **Bot protection** | Google reCAPTCHA v3 (invisible, score-based) | Locked |
 
 ---
 
@@ -227,11 +234,17 @@ coffeepotsocial/
   followerCount: Number,      // denormalised counter
   followingCount: Number,     // denormalised counter
   fcmTokens: [String],        // FCM device tokens for push notifications (array for multi-device)
-  newsletterOptIn: Boolean,   // true if user opted in on signup (checkbox pre-checked); default: true
+  newsletterOptIn: Boolean,   // true if user explicitly opted in on signup (checkbox unchecked by default); default: false
   newsletterSynced: Boolean,  // false until exported to newsletter API by sync worker; default: false
+  deletedAt: Date,            // nullable — set on self-service deletion request; hard purge after 30 days
   createdAt: Date,
   updatedAt: Date
 }
+
+// Field length constraints (enforced via FluentValidation at API boundary):
+//   username:    3–30 chars, alphanumeric + underscores only
+//   displayName: 1–50 chars
+//   bio:         max 160 chars
 
 // Indexes:
 //   { firebaseUid: 1 }  unique  — primary lookup on every auth'd request
@@ -249,6 +262,14 @@ coffeepotsocial/
   _id: ObjectId,
   authorId: ObjectId,         // ref: users
   body: String,               // max 280 chars; nullable for media-only posts
+  hashtags: [String],         // extracted on write from #tag patterns in body; e.g. ["coffee", "tech"] — post-MVP
+  linkPreview: {              // nullable — first URL's OG metadata, fetched server-side on post create — post-MVP
+    url: String,
+    title: String,
+    description: String,
+    imageUrl: String,
+    fetchedAt: Date
+  },
   replyToId: ObjectId,        // ref: posts — nullable
   repostOfId: ObjectId,       // ref: posts — nullable
   media: [                    // embedded array (up to 4 items)
@@ -263,14 +284,19 @@ coffeepotsocial/
   replyCount: Number,         // denormalised counter
   repostCount: Number,        // denormalised counter
   hidden: Boolean,            // default: false — moderator action
+  deletedAt: Date,            // nullable — set on soft delete; hard purge after 7-day grace period
   createdAt: Date
 }
+
+// Field length constraints:
+//   body: max 280 chars (nullable for media-only posts)
 
 // Indexes:
 //   { authorId: 1, createdAt: -1 }     — user timeline
 //   { createdAt: -1 }                   — public timeline
 //   { replyToId: 1, createdAt: 1 }     — reply threads
 //   text index on { body }             — full-text post search
+//   { hashtags: 1 }                    — hashtag browse/search (post-MVP)
 ```
 
 ### Collection: `media`
@@ -324,13 +350,27 @@ coffeepotsocial/
 //   { postId: 1 }              — like counts / who liked a post
 ```
 
+### Collection: `reposts`
+```js
+{
+  _id: ObjectId,
+  userId: ObjectId,           // ref: users
+  postId: ObjectId,           // ref: posts
+  createdAt: Date
+}
+
+// Indexes:
+//   { userId: 1, postId: 1 }  unique  — enforces one repost per user per post; supports undo repost
+//   { postId: 1 }              — repost counts / who reposted a post
+```
+
 ### Collection: `notifications`
 ```js
 {
   _id: ObjectId,
   recipientId: ObjectId,      // ref: users
   actorId: ObjectId,          // ref: users
-  type: String,               // "like" | "reply" | "follow" | "repost"
+  type: String,               // "like" | "reply" | "follow" | "repost" | "mention"
   postId: ObjectId,           // ref: posts — nullable
   read: Boolean,              // default: false
   createdAt: Date
@@ -339,6 +379,23 @@ coffeepotsocial/
 // Indexes:
 //   { recipientId: 1, read: 1, createdAt: -1 }
 ```
+
+### Collection: `blocks`
+```js
+{
+  _id: ObjectId,
+  blockerId: ObjectId,        // ref: users — the user who initiated the block
+  blockedId: ObjectId,        // ref: users — the user being blocked
+  createdAt: Date
+}
+
+// Indexes:
+//   { blockerId: 1, blockedId: 1 }  unique
+//   { blockerId: 1 }                 — "who have I blocked?" (used to filter feeds/search)
+//   { blockedId: 1 }                 — "who has blocked me?" (used to prevent reverse discovery)
+```
+
+> **Post-MVP feature** — collection defined now so the index and query patterns are considered from the start. When implemented: blocked users are hidden from each other's feeds, search results, and notifications; blocking is one-directional but mutual follow is severed.
 
 ### Collection: `reports`
 ```js
@@ -412,8 +469,11 @@ POST   /api/v1/auth/unlink/:provider        — unlink a provider from the Fireb
 
 ### Users
 ```
-GET    /api/v1/users/:username              — public profile
+GET    /api/v1/users/me                     — authenticated user's own profile (includes private fields)
 PATCH  /api/v1/users/me                     — update own profile
+DELETE /api/v1/users/me                     — request account deletion (GDPR Art. 17); soft-deletes immediately, hard purge within 30 days
+GET    /api/v1/users/me/export              — request data export (GDPR Art. 20); returns all user data as JSON or triggers async export email
+GET    /api/v1/users/:username              — public profile
 GET    /api/v1/users/:username/posts        — user's posts (paginated)
 GET    /api/v1/users/:username/followers    — follower list
 GET    /api/v1/users/:username/following    — following list
@@ -463,7 +523,10 @@ DELETE /api/v1/me/fcm-token                 — unregister FCM token (on logout 
 ```
 GET    /api/v1/search/users?q=              — search users by username / display name
 GET    /api/v1/search/posts?q=              — full-text search over posts
+GET    /api/v1/search/hashtags/:tag         — browse posts by hashtag (post-MVP)
 ```
+
+> **Implementation note:** Full-text post search uses MongoDB's `$text` operator against the text index on `posts.body` (defined in §6) — no additional search infrastructure required for MVP. Results are sorted by relevance score (`{ score: { $meta: "textScore" } }`). Hashtag search (post-MVP) queries `{ hashtags: "tag" }` using the `hashtags` array index.
 
 ### Reports
 ```
@@ -555,7 +618,8 @@ All authentication is handled by **Firebase Auth** — we do not implement our o
 | Google Sign-In | Google (via Firebase) | Standard OAuth, managed by Firebase |
 | Facebook Sign-In | Meta (via Firebase) | Requires Meta app registration |
 
-> **Apple Sign-In is not supported.** Required for iOS App Store submission but not in scope — no Apple Developer account. Android and web-only for now.
+> **Apple Sign-In is not supported for MVP.** Android and web-only for now — no Apple Developer account.
+> **Important for future iOS App Store submission:** Apple's App Store Review Guidelines (Guideline 4.8) require that any app offering third-party social login (Google, Facebook, etc.) must also offer Sign In with Apple. When iOS is targeted post-MVP, Sign In with Apple must be added via Firebase Auth before App Store submission.
 
 ### Firebase User ↔ MongoDB User Mapping
 
@@ -591,7 +655,7 @@ admin      — full access including admin dashboard
 - All API endpoints require a valid Firebase ID token (except public read endpoints)
 - Token verification uses Firebase Admin SDK for .NET — validates against Firebase JWKS, checks `aud` and `iss` claims
 - Rate limiting enforced at Zuplo (not the application layer)
-- Account suspension: suspended users receive a 403 on every request — checked after token verification
+- Account suspension: suspended users receive a 403 on every request — checked after token verification. **On suspension, `FirebaseAuth.RevokeRefreshTokensAsync(uid)` must be called immediately** so the user's existing tokens are invalidated within seconds rather than waiting up to 1 hour for natural token expiry. The middleware must then check `tokensValidAfterTime` on the decoded token against the Firebase user record to enforce revocation.
 - Account lockout, brute-force protection, and suspicious login detection are handled by Firebase Auth
 - Firebase credentials and service account keys never committed to source control; stored in secrets manager
 
@@ -616,8 +680,8 @@ Both images and videos use the same S3-compatible presigned URL pattern against 
 **Images (avatars, post photos):**
 ```
 1. Client requests a presigned R2 upload URL from API
-   POST /media/upload-url  →  { uploadUrl, mediaId, r2Key }
-   (API generates S3 presigned PUT URL against R2 using AWS SDK)
+   POST /media/upload-url  →  { uploadUrl, mediaId, r2Key, expiresAt }
+   (API generates S3 presigned PUT URL against R2 using AWS SDK; URL TTL = 15 minutes)
 
 2. Client uploads image directly to R2
    PUT {uploadUrl}  (bypasses API server — R2 receives the file directly)
@@ -636,7 +700,8 @@ Both images and videos use the same S3-compatible presigned URL pattern against 
 **Videos (post video attachments — post-MVP):**
 ```
 1. Client requests a presigned R2 upload URL from API
-   POST /media/upload-url  →  { uploadUrl, mediaId, r2Key }
+   POST /media/upload-url  →  { uploadUrl, mediaId, r2Key, expiresAt }
+   (URL TTL = 15 minutes)
 
 2. Client uploads video directly to R2
    PUT {uploadUrl}  (bypasses API server)
@@ -659,9 +724,10 @@ Both images and videos use the same S3-compatible presigned URL pattern against 
 
 Images are **not processed in-process**. After upload to R2, Cloudflare Image Resizing handles all transforms on-demand at CDN delivery time — no worker, no ImageSharp, no pre-generating variants.
 
-- **Validation (pre-upload):** verify file magic bytes on the server before issuing the presigned URL; reject if not JPEG/PNG/WebP/GIF; enforce 20MB max
-- **Safety scan:** optional perceptual hash check against known CSAM databases before issuing the upload URL
-- **EXIF strip:** strip EXIF metadata server-side before upload (or as a lightweight pre-process step); R2 does not strip automatically unlike Cloudflare Images
+- **Validation (pre-upload):** the client declares `contentType` and `byteSize` when requesting the presigned URL; the API validates the declared type is permitted and the declared size is within limits before issuing the URL. This is a declaration check only — actual byte-level validation happens post-upload.
+- **Validation (post-upload):** after the client calls `POST /media/:id/complete`, the processing worker fetches the object from R2 and validates magic bytes (not just extension or MIME header) before marking the media `ready`. Rejects if actual content type does not match the declaration.
+- **Safety scan:** perceptual hash check against known CSAM databases runs **post-upload in the processing worker**, not pre-upload (the file does not exist server-side until after the client PUT to R2). Media stays in `processing` status until the scan completes; posts cannot reference media in any status other than `ready`.
+- **EXIF strip:** strip EXIF metadata **client-side before upload** (e.g. using a canvas re-encode in the Ionic app) or as a **post-upload worker step** that re-writes the object in R2; server-side stripping before upload is not possible because the file goes directly from the client to R2 via presigned URL, bypassing the API server. R2 does not strip automatically unlike Cloudflare Images
 - **Resizing & format:** handled at CDN delivery time via URL query parameters:
   - Avatar large: `?width=400&height=400&fit=cover&format=webp`
   - Avatar small: `?width=100&height=100&fit=cover&format=webp`
@@ -755,50 +821,11 @@ Push notifications are delivered via **Firebase Cloud Messaging (FCM)** to Andro
 | Someone replied to your post | Yes |
 | Someone followed you | Yes |
 | Someone reposted your post | Yes |
+| Someone mentioned you in a post | Yes |
 
 ### Web Push
 - PWA supports push notifications via FCM Web SDK (requires HTTPS and notification permission)
 - Ionic Capacitor provides native Android push via FCM automatically
-
----
-
----
-
-## 9c. Newsletter Opt-In & Sync
-
-On signup, users are offered the option to join the CoffeePotSocial newsletter. The checkbox is **pre-checked** — users must actively uncheck to opt out.
-
-### Signup UI
-- Checkbox label: *"Also add me to the Coffee Pot Newsletter"*
-- Pre-checked: `true`
-- Value posted to our API along with the rest of the registration payload and stored as `newsletterOptIn: true/false` on the `users` document
-- Only shown on email/password and social sign-up flows (not on subsequent logins)
-
-### Sync Flow
-
-```
-1. User signs up with newsletterOptIn = true → stored in MongoDB, newsletterSynced = false
-
-2. NewsletterSyncWorker (IHostedService, scheduled — e.g. every 15 minutes or nightly)
-   queries: { newsletterOptIn: true, newsletterSynced: false }
-
-3. For each matched user, worker calls the newsletter provider API
-   to add the email address (and optionally displayName) as a subscriber
-
-4. On success, worker marks newsletterSynced = true on the user document
-   On failure, leaves newsletterSynced = false — will be retried on next run
-
-5. If a user later opts out (account settings toggle), newsletterOptIn is set to false
-   A separate unsubscribe call is made to the newsletter provider API
-```
-
-### Notes
-- Newsletter provider is **Beehiiv** — sync uses the Beehiiv REST API (`POST /v2/publications/{id}/subscriptions`)
-- `newsletterSynced: true` is set once Beehiiv confirms the subscription (HTTP 200/201)
-- The `newsletterSynced` flag makes the sync idempotent — safe to re-run without double-subscribing
-- User emails are never shared externally beyond the newsletter provider
-- Opt-out must be available in account settings (GDPR requirement for pre-checked consent)
-- The sync worker is lightweight and low-frequency; no dedicated infrastructure needed
 
 ---
 
@@ -824,6 +851,45 @@ Google Analytics is integrated client-side in the Ionic app via the **Firebase S
 
 ---
 
+## 9c. Newsletter Opt-In & Sync
+
+On signup, users are offered the option to join the CoffeePotSocial newsletter. The checkbox is **unchecked by default** — users must actively check it to opt in.
+
+> **GDPR compliance:** GDPR Recital 32 explicitly prohibits pre-ticked consent boxes for marketing communications. Consent must be freely given, specific, informed, and unambiguous. Pre-checked opt-in is not valid consent under GDPR.
+
+### Signup UI
+- Checkbox label: *"Also add me to the Coffee Pot Newsletter"*
+- Default: **unchecked** — affirmative opt-in required
+- Value posted to our API along with the rest of the registration payload and stored as `newsletterOptIn: true/false` on the `users` document
+- Only shown on email/password and social sign-up flows (not on subsequent logins)
+
+### Sync Flow
+
+```
+1. User signs up with newsletterOptIn = true → stored in MongoDB, newsletterSynced = false
+
+2. NewsletterSyncWorker (IHostedService, scheduled — e.g. every 15 minutes or nightly)
+   queries: { newsletterOptIn: true, newsletterSynced: false }
+
+3. For each matched user, worker calls the newsletter provider API
+   to add the email address (and optionally displayName) as a subscriber
+
+4. On success, worker marks newsletterSynced = true on the user document
+   On failure, leaves newsletterSynced = false — will be retried on next run
+
+5. If a user later opts out (account settings toggle), newsletterOptIn is set to false
+   A separate unsubscribe call is made to the newsletter provider API
+```
+
+### Notes
+- Newsletter provider is **Beehiiv** — sync uses the Beehiiv REST API (`POST /v2/publications/{id}/subscriptions`)
+- **Double opt-in is enabled** — Beehiiv sends a confirmation email before activating the subscription. This is GDPR best practice and reduces spam complaint rates. The `newsletterSynced` flag is set `true` after Beehiiv accepts the subscription request, regardless of whether the user has clicked the confirmation email (Beehiiv manages that state internally).
+- `newsletterSynced: true` is set once Beehiiv confirms receipt of the subscription request (HTTP 200/201)
+- The `newsletterSynced` flag makes the sync idempotent — safe to re-run without double-subscribing
+- User emails are never shared externally beyond the newsletter provider
+- Opt-out must be available in account settings at any time (GDPR requirement)
+- The sync worker is lightweight and low-frequency; no dedicated infrastructure needed
+
 ---
 
 ## 10. Monitoring & Observability
@@ -837,7 +903,7 @@ A production system that isn't observable is a system you can't operate. Observa
 - Log levels: `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`
 - Every request logged with: `requestId`, `userId` (if authenticated), `method`, `path`, `statusCode`, `durationMs`
 - Sentry captures errors and exceptions with full stack traces and request context automatically
-- Logs aggregator TBD (DigitalOcean built-in log forwarding likely sufficient for MVP)
+- Logs aggregated to **Grafana Loki** via **Grafana Cloud** (free tier — 50 GB/month, 14-day retention). Structured JSON logs are shipped from ASP.NET Core via the Serilog Grafana Loki sink or the OpenTelemetry log exporter to Grafana Cloud's OTLP endpoint. Integrates directly with the Grafana dashboards used for metrics — one platform for logs, metrics, and traces.
 - **Never log:** passwords, tokens, full OAuth credentials, PII beyond userId
 
 #### 2. Metrics
@@ -885,8 +951,8 @@ GET /readyz            — readiness probe (is the app ready to serve traffic?)
 
 ### Uptime Monitoring
 
-- External uptime checks from at least 2 geographic regions (e.g. BetterStack, UptimeRobot)
-- Public status page (e.g. [status.coffeepotsocial.com](https://status.coffeepotsocial.com)) — automated updates on incidents
+- External uptime checks via **UptimeRobot** (free tier — 50 monitors, 5-minute check interval, checks from 2 geographic regions, email alerting on downtime)
+- Public status page at **status.coffeepotsocial.com** powered by UptimeRobot's free hosted status page — no additional tooling required
 - SLA targets tracked per calendar month
 
 ---
@@ -981,12 +1047,14 @@ No premature optimisation — the DO managed cluster handles replication, failov
 
 | Cached Data | TTL | Invalidation |
 |---|---|---|
-| User session | 7 days (rolling) | Explicit logout / admin revoke |
+| Firebase UID → User document lookup | 5 minutes | On profile update / suspension change |
 | Public timeline feed | 30 seconds | TTL expiry |
 | User profile (public) | 5 minutes | On profile update |
 | Post data | 5 minutes | On post delete |
 | Rate limit counters | Per window (60s) | TTL expiry |
 | Feature flags | 60 seconds | On update |
+
+> **Note:** There are no server-side sessions — Firebase ID tokens are verified statelessly (see §8). Redis is not used for session storage. The UID → User lookup cache above is an optional performance optimisation to avoid a MongoDB lookup on every request.
 
 ### Queue & Worker Scaling
 
@@ -1002,12 +1070,141 @@ No premature optimisation — the DO managed cluster handles replication, failov
 | **Orchestration** | Docker Compose for local dev; DigitalOcean App Platform or Kubernetes for production (TBD) |
 | **IaC** | Terraform — all cloud infrastructure (DO resources, DNS, Cloudflare) defined as code from day one |
 | **Environments** | `local` → `staging` → `production` — each environment has its own Terraform workspace |
-| **CI/CD** | GitHub Actions: lint → test → build → deploy to staging on PR merge; promote to production manually |
+| **CI/CD** | GitHub Actions (see §12a below for full pipeline detail) |
 | **Database** | DigitalOcean managed MongoDB cluster (handles replication, backups, failover) |
-| **Secrets management** | Environment variables via `.env` locally; DigitalOcean App Platform secrets or DO Vault in production; Terraform state stored in remote backend (Cloudflare R2) with encryption |
+| **Secrets management** | Environment variables via `.env` locally; DigitalOcean App Platform secrets or DO Vault in production; Terraform state stored in remote backend (Cloudflare R2) with encryption. **Note:** R2 does not support DynamoDB-style state locking — concurrent `terraform apply` runs (e.g. two CI pipelines) can corrupt state. Mitigate by serialising Terraform runs in CI (one job at a time) or using a separate locking mechanism (e.g. a small DynamoDB table or Terraform Cloud for state management). |
 | **Backups** | Automated daily snapshots via DO managed DB; tested restore procedure; retention: 30 days |
 
+---
+
+## 12a. CI/CD Pipeline (GitHub Actions)
+
+All automation runs in **GitHub Actions**. Workflow definitions live in `actions/` at the repository root. The pipeline has three concerns: quality gates on every PR, automated deployment to staging, and gated promotion to production.
+
+### Branch Strategy & Triggers
+
+| Branch | Purpose | Triggers |
+|---|---|---|
+| `main` | Production-ready code | Deploy to **production** on manual approval after staging passes |
+| `staging` | Pre-production integration | Deploy to **staging** automatically on merge |
+| `feature/*`, `fix/*`, `chore/*` | Day-to-day work | PR quality gates only — no deployment |
+
+All work is done on short-lived branches. PRs target `main`. On merge to `main`, staging is deployed automatically; production requires a manual approval step.
+
+### Workflow Files
+
+| File | Runs On | Jobs |
+|---|---|---|
+| `ci.yml` | Every push + PR | Lint, test, build (all three apps + API) |
+| `deploy-staging.yml` | Merge to `main` | Build Docker images → push to registry → deploy to staging environment |
+| `deploy-production.yml` | Manual trigger (with approval gate) | Deploy already-built staging images to production |
+| `security.yml` | Every push + PR | CodeQL, Semgrep, Gitleaks (see §13) |
+| `terraform.yml` | Changes to `infra/` | `terraform plan` on PR; `terraform apply` on merge (serialised — one job at a time to avoid R2 state corruption) |
+
+### PR Quality Gates (`ci.yml`)
+
+A PR cannot be merged unless all of these pass:
+
+```
+┌─────────────────────────────────────────────────┐
+│                   ci.yml                        │
+│                                                 │
+│  lint-api        — dotnet format --verify-no-changes    │
+│  lint-client     — ng lint (clientapp + admin)  │
+│                                                 │
+│  test-api        — dotnet test (unit + integration)     │
+│                   ↳ spins up MongoDB + Redis    │
+│                     as service containers       │
+│                                                 │
+│  test-client     — ng test --watch=false        │
+│                                                 │
+│  build-api       — dotnet publish (Release)     │
+│  build-client    — ng build --configuration=production  │
+│  build-admin     — ng build --configuration=production  │
+│                                                 │
+│  docker-build    — docker build (smoke check,   │
+│                   no push on PRs)               │
+└─────────────────────────────────────────────────┘
+```
+
+### Test Environment in CI
+
+Integration tests run against **real service containers** — not mocks:
+
+```yaml
+services:
+  mongodb:
+    image: mongo:7
+    ports: ["27017:27017"]
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+```
+
+This matches the decision in §9 to avoid mock/prod divergence. MinIO is used in place of Cloudflare R2 for any storage-touching tests.
+
+### Deployment Flow
+
+```
+PR opened
+  └─► ci.yml + security.yml run (quality gates)
+        └─► PR approved + merged to main
+              └─► deploy-staging.yml triggers automatically
+                    └─► Docker images built + tagged (SHA + "staging")
+                    └─► Images pushed to container registry
+                    └─► Staging environment updated
+                    └─► Smoke tests run against staging
+                          └─► (manual approval required)
+                                └─► deploy-production.yml triggered
+                                      └─► Same images promoted (no rebuild)
+                                      └─► Production environment updated
+```
+
+> **No rebuild on promotion** — the exact Docker image tested on staging is what goes to production. Images are tagged with the git SHA; `staging` and `production` tags are aliases pointing at the same digest.
+
+### Secrets in GitHub Actions
+
+Secrets are stored in **GitHub Actions Secrets** (repository or environment-scoped) and injected as environment variables at runtime. They are never logged, never committed, and never appear in build output.
+
+| Secret | Scope | Used By |
+|---|---|---|
+| `FIREBASE_SERVICE_ACCOUNT_JSON` | Production + Staging envs | API — Firebase Admin SDK |
+| `MONGODB_URI` | Production + Staging envs | API — database connection |
+| `REDIS_URL` | Production + Staging envs | API — cache connection |
+| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | Production + Staging envs | API — Cloudflare R2 |
+| `DO_API_TOKEN` | Repository | deploy workflows — DigitalOcean API |
+| `CLOUDFLARE_API_TOKEN` | Repository | Terraform — Cloudflare DNS/R2 config |
+| `SEMGREP_APP_TOKEN` | Repository | security.yml — Semgrep CI |
+
+Environment-scoped secrets (staging vs. production) ensure staging jobs cannot touch production infrastructure.
+
+### Database Migration Strategy
+
+MongoDB is schemaless but production data still requires intentional migrations when fields are added, renamed, or removed.
+
+- **Migration runner:** [Mongo.Migration](https://github.com/SRoddis/Mongo.Migration) (or a lightweight custom runner) integrated into the ASP.NET Core startup pipeline — runs outstanding migrations on boot before the API begins serving traffic
+- **Migration files** live in `api/Migrations/` and are numbered sequentially (e.g. `M001_AddDeletedAtToUsers.cs`)
+- **CI gate:** migrations are run against a throw-away MongoDB container in the `test-api` job to catch failures before staging deploy
+- **Backwards compatibility:** new fields default to `null` or a safe value — existing documents remain valid without a full backfill. Backfills run as a background task after deploy, not during startup
+- **No destructive migrations in the same deploy as code that depends on them** — use a two-phase pattern: deploy code that handles both old and new shape, then migrate, then clean up
+
+### Rollback Strategy
+
+Rolling back a bad production deploy follows the same path as promotion — the pipeline re-points the production tag to the previous Docker image SHA:
+
+```
+1. Identify the last known-good image SHA from the deployment log or container registry
+2. Manually trigger deploy-production.yml with the target SHA override
+3. The same image that was previously on production is re-deployed — no rebuild
+4. Database migrations are not automatically reversed — if a migration was destructive,
+   restore from the most recent automated DO snapshot (daily; up to 30 days retention)
+```
+
+> **Migration-aware rollback rule:** if the deployment included a database migration, assess whether the previous code version is compatible with the migrated schema before rolling back the application. If not, a DB restore may be required — this is the primary reason destructive migrations are prohibited in single deploys.
+
 ### Local Development
+
+
 
 Every developer should be able to run the full stack locally with a single command:
 
@@ -1026,6 +1223,8 @@ Services brought up locally:
 
 > **R2 in local dev:** MinIO fully emulates R2's S3-compatible API — presigned URLs, bucket operations, and AWS SDK calls all work identically. Configure the AWS SDK to point at `http://localhost:9000` locally and `https://<account>.r2.cloudflarestorage.com` in production. Cloudflare Image Resizing has no local emulator; during local dev, serve images directly from MinIO without transforms, and test resizing against the real CF CDN in a staging environment.
 
+> **Firebase in local dev:** The [Firebase Emulator Suite](https://firebase.google.com/docs/emulator-suite) provides local emulators for Firebase Auth (`localhost:9099`) and FCM (`localhost:8085`). Configure the Firebase Admin SDK to target the emulator host in `local` and `test` environments (via `FIREBASE_AUTH_EMULATOR_HOST` environment variable). This enables auth testing — token expiry, suspended users, provider linking — without hitting production Firebase services or consuming real quota.
+
 Seed data script (dotnet run --project tools/seed) to populate local DB with test users, posts, follows.
 
 ---
@@ -1037,16 +1236,105 @@ Security is not a phase — it's a continuous practice. This section tracks spec
 ### Security Controls
 - All user input validated and sanitised at the API boundary (ASP.NET Core model validation + FluentValidation)
 - **NoSQL injection prevention:** never construct MongoDB queries from raw user input strings; use the official .NET MongoDB driver's typed builders (`FilterDefinitionBuilder<T>`) exclusively
-- HTML sanitisation on any content rendered in the Ionic frontend (prevent XSS — Ionic renders as WebView)
 - File upload: type validated by magic bytes, not just extension or MIME header
 - Request body size limits enforced at both Zuplo (gateway) and ASP.NET Core levels
 - Firebase service account key stored in secrets manager; never committed to source control
+- **Open redirect prevention:** any `?redirect=`, `?next=`, or `?returnUrl=` query parameter used in post-login or post-action flows must be validated as a same-origin relative path before following. Absolute URLs and any value containing `://` or `//` are rejected with a 400. This prevents phishing attacks that abuse trusted domains as redirect launchers.
+- **Subresource Integrity (SRI):** third-party scripts loaded via `<script src>` tags (Termly consent widget) must include `integrity=` and `crossorigin="anonymous"` attributes. This ensures a compromised CDN cannot serve a modified script. reCAPTCHA is loaded dynamically by Google's SDK so SRI is not applicable there, but `script-src` in the CSP is scoped to Google's specific domains as a compensating control.
+
+### XSS Prevention
+
+Ionic renders as a WebView — XSS is a first-class concern. Defence is layered across write time, render time, and the browser itself.
+
+#### Server-side (write time)
+- **Sanitise on write, not only on render.** Post body content is sanitised server-side using a server-side HTML sanitiser (e.g. [HtmlSanitizer](https://github.com/mganss/HtmlSanitizer) for .NET) before storing to MongoDB. Stored values are the last line of defence if content is ever consumed outside Angular's context (admin tools, exports, future API consumers).
+- Strip all HTML tags from plain-text fields (`username`, `displayName`, `bio`). Only `post.body` requires sanitisation of allowed inline formatting if rich text is introduced — for MVP, treat all post content as plain text only.
+
+#### Client-side (render time)
+- **Angular template engine auto-escapes** all interpolated values (`{{ }}`) and property bindings by default — do not bypass this.
+- **`[innerHTML]` bindings are prohibited** unless the value has been explicitly passed through Angular's `DomSanitizer.sanitizeHtml()` first. Any use of `bypassSecurityTrustHtml()`, `bypassSecurityTrustScript()`, or similar `bypassSecurityTrust*` methods requires a security review comment explaining why it is safe.
+- **DOMPurify** is the approved library for any case where Angular's built-in sanitisation is insufficient (e.g. rendering user-generated rich text). Import once, configure a strict allowlist, reuse everywhere.
+
+#### Browser-level (CSP + Trusted Types)
+- CSP is defined in the section below.
+- **`require-trusted-types-for 'script'`** is added to the CSP to prevent DOM XSS by requiring all dangerous DOM sink assignments (e.g. `innerHTML`, `eval`) to go through a Trusted Types policy. This eliminates entire classes of DOM injection at the browser level. Angular 15+ has native Trusted Types support.
+
+#### Capacitor WebView bridge
+- The Capacitor native bridge (`window.Capacitor`) exposes native plugin APIs to JavaScript running inside the WebView. A successful XSS payload could call native plugins (filesystem, camera, etc.).
+- **Mitigation:** only expose the minimum required Capacitor plugins; disable unused plugins in `capacitor.config.ts`. Combine with CSP to prevent inline script execution and `script-src` to prevent loading external scripts.
 
 ### Transport Security
 - HTTPS enforced everywhere — HTTP redirects to HTTPS
 - HSTS header with `includeSubDomains`
 - TLS 1.2 minimum; TLS 1.3 preferred
-- Secure + HttpOnly + SameSite cookies
+- Cookies use `Secure; HttpOnly; SameSite=Strict` — `SameSite=Strict` is chosen over `Lax` because no legitimate flow requires a cookie to be sent on a cross-site top-level navigation
+
+### HTTP Security Headers
+
+All security headers are set at the **Zuplo API gateway** for API responses, and at the **Cloudflare edge** for the static frontend assets. ASP.NET Core also sets them as a fallback for any response that bypasses the gateway (e.g. direct internal calls in staging).
+
+| Header | Value | Purpose |
+|---|---|---|
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains; preload` | HSTS — forces HTTPS for 1 year |
+| `X-Frame-Options` | `DENY` | Clickjacking — prevents embedding in iframes (legacy browser fallback for `frame-ancestors`) |
+| `X-Content-Type-Options` | `nosniff` | Prevents MIME-type sniffing; browser must honour declared `Content-Type` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | Sends full path on same-origin requests; only the origin on cross-origin; nothing on downgrade |
+| `Permissions-Policy` | `camera=(), microphone=(), geolocation=(), payment=()` | Disables browser features the app does not use |
+| `Content-Security-Policy` | See CSP section below | XSS, clickjacking, Trusted Types enforcement |
+
+> `X-Frame-Options: DENY` is belt-and-suspenders alongside `frame-ancestors 'none'` in the CSP — older browsers honour `X-Frame-Options` but not `frame-ancestors`.
+
+### CSRF Protection
+
+**CSRF attacks are not applicable to this API by design** — all state-changing requests require an `Authorization: Bearer <firebase-id-token>` header. Browsers will not send custom headers cross-origin without explicit CORS permission, and the CORS policy is strictly allowlisted. There are no cookie-authenticated endpoints.
+
+This is an explicit design decision, not an oversight. The rationale:
+- Session cookies as auth tokens are what make CSRF possible — we use none
+- Firebase ID tokens are short-lived JWTs sent in the `Authorization` header only
+- Even if a malicious page tricks a user's browser into making a cross-origin request, the browser will not attach the `Authorization` header, so the request arrives unauthenticated and is rejected
+
+**Angular `HttpClient` XSRF interceptor is intentionally disabled** for the API client — it is irrelevant to Bearer token auth and would add unnecessary cookie overhead. This should be explicitly configured in the Angular `provideHttpClient()` setup with `withNoXsrfProtection()` to make the decision self-documenting in code.
+
+**Defence-in-depth: `Origin` header validation** — Zuplo is configured to reject requests where the `Origin` header is present but does not match the allowlist (same list as CORS). This provides an additional layer against CSRF attempts on any future endpoints that might inadvertently use cookies.
+
+### CORS Policy
+
+CORS is explicitly configured in ASP.NET Core — no wildcards. Only allowlisted origins may call the API:
+
+| Environment | Allowed Origins |
+|---|---|
+| Production | `https://coffeepotsocial.com`, `https://admin.coffeepotsocial.com` |
+| Staging | `https://staging.coffeepotsocial.com`, `https://admin.staging.coffeepotsocial.com` |
+| Local dev | `http://localhost:4200` (clientapp), `http://localhost:4201` (admin), `http://localhost:8100` (Ionic dev server) |
+
+Allowed methods: `GET, POST, PUT, PATCH, DELETE, OPTIONS`. Allowed headers: `Authorization, Content-Type`. Credentials: allowed (for cookie support). Preflight responses cached for 600 seconds.
+
+### Content Security Policy (CSP)
+
+A strict CSP is set on all responses from the Ionic web/PWA frontend to limit XSS blast radius (Ionic renders as a WebView):
+
+```
+Content-Security-Policy:
+  default-src 'self';
+  script-src 'self' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/
+             https://cdn.termly.io https://www.googletagmanager.com;
+  style-src 'self' 'unsafe-inline';
+  img-src 'self' data: https://assets.coffeepotsocial.com;
+  connect-src 'self' https://api.coffeepotsocial.com https://www.google-analytics.com
+              https://firebaseinstallations.googleapis.com https://fcmregistrations.googleapis.com;
+  frame-src https://www.google.com/recaptcha/;
+  frame-ancestors 'none';
+  object-src 'none';
+  base-uri 'self';
+  form-action 'self';
+  require-trusted-types-for 'script';
+```
+
+- `'unsafe-inline'` on `style-src` is a pragmatic concession for Ionic's runtime styles — tighten via nonces in a post-MVP hardening pass
+- `frame-ancestors 'none'` prevents the app from being embedded in any iframe on any origin — this is the clickjacking defence (see also `X-Frame-Options` below)
+- `require-trusted-types-for 'script'` enforces Trusted Types — eliminates DOM XSS sink injection; Angular 15+ supports this natively
+- CSP is enforced (`Content-Security-Policy`), not report-only, from day one
+- The admin app has its own stricter CSP (no analytics, no reCAPTCHA)
 
 ### Rate Limiting
 Primary enforcement at **Zuplo** (API gateway layer) — the ASP.NET Core backend is not the first line of defence:
@@ -1058,6 +1346,70 @@ Primary enforcement at **Zuplo** (API gateway layer) — the ASP.NET Core backen
 | Media upload URL requests | 20/hour per user |
 | General API | 300 req/min per authenticated user |
 | Public/unauthenticated | 60 req/min per IP |
+| Admin / moderation routes | 60 req/min per admin user |
+| Data export (`/users/me/export`) | 3 req/day per user |
+
+### Bot Protection (Google reCAPTCHA v3)
+
+**Google reCAPTCHA v3** runs invisibly — no challenge is shown to the user. It returns a score (0.0–1.0) indicating how likely the interaction is human. The API verifies the token server-side before processing sensitive actions.
+
+#### Where It Is Applied
+
+| Action | Score Threshold | Reason |
+|---|---|---|
+| Account registration | ≥ 0.7 | Highest-risk action — prevents bulk account creation |
+| Login | ≥ 0.5 | Bot credential stuffing detection |
+| Password reset request | ≥ 0.7 | Prevents enumeration / abuse |
+| Post creation | ≥ 0.5 | Anti-spam on content submission |
+| Report submission | ≥ 0.5 | Prevents report-flooding abuse |
+
+> Scores below the threshold return a `400 Bad Request` with a generic error — do not reveal the score or threshold to the client.
+
+#### Client Integration
+
+- **Web / PWA (Ionic Angular):** Load the reCAPTCHA v3 script, call `grecaptcha.execute(siteKey, { action: 'signup' })` to obtain a token, and include it in the request body as `recaptchaToken`.
+- **Android (Capacitor):** reCAPTCHA v3 runs in the embedded WebView via the same JS SDK. For native Android builds, the Google Play Integrity API is the recommended alternative post-MVP if higher assurance is needed.
+- **Admin app:** Admin actions do not require reCAPTCHA — admins are authenticated, low-volume, and known actors.
+
+#### Server-Side Verification
+
+The ASP.NET Core API verifies the token before processing the action:
+
+```
+POST https://www.google.com/recaptcha/api/siteverify
+  secret=<RECAPTCHA_SECRET_KEY>
+  response=<client_token>
+  remoteip=<client_ip>   ← optional but recommended
+
+Response:
+{
+  "success": true,
+  "score": 0.9,
+  "action": "signup",    ← validate this matches the expected action
+  "hostname": "coffeepotsocial.com"
+}
+```
+
+Validation steps: `success = true`, score ≥ threshold, `action` matches expected value, `hostname` matches your domain.
+
+#### Key Management
+
+- Separate **site keys** for web and Android (Google issues per-platform keys)
+- `RECAPTCHA_SECRET_KEY` stored in GitHub Actions Secrets / DO App Platform secrets — never committed
+- reCAPTCHA is **disabled in local/development environment** (use a test key that always returns score 1.0)
+- Enterprise tier available if volume demands it; v3 free tier is generous for MVP
+
+### Static Analysis & Secrets Scanning (CI)
+
+Three tools run in GitHub Actions on every push and PR. All three are free for public open-source repos and output SARIF, which feeds into GitHub's unified Security tab — one dashboard, not three.
+
+| Tool | Type | What It Catches |
+|---|---|---|
+| **CodeQL** | SAST (semantic) | Deep taint-tracking analysis; SQL/NoSQL injection, XSS, auth bypasses, and more. Enabled via GitHub repo settings or Actions workflow. Results appear inline on PRs in the Security tab. Supports C#, JavaScript/TypeScript, and more. |
+| **Semgrep** | SAST (pattern-based) | Fast (~30s) pattern matching against 2,000+ community rules across 30+ languages. Strong TypeScript/JavaScript coverage for the Ionic frontend. Runs as an Actions step; blocks merges on critical findings via SARIF upload. |
+| **Gitleaks** | Secrets detection | Scans for hardcoded API keys, tokens, passwords, and credentials in committed code and full git history. Critical for a public repo with multiple contributors. Runs on every push and PR. |
+
+**Severity strategy:** alert only on high/critical findings to avoid alert fatigue. Tune down to medium/low over time as noise levels are understood.
 
 ### Dependency Security
 - `dotnet list package --vulnerable` run in CI — build fails on high/critical vulnerabilities
@@ -1078,19 +1430,21 @@ Additional privacy practices:
 - OAuth tokens: used transiently, not persisted beyond what's needed
 - User emails: never exposed publicly via API
 - EXIF data stripped from all uploaded images before storage
-- GDPR-compatible account deletion: all user data purged within 30 days of request
+- GDPR-compatible account deletion: all user data purged within 30 days of request; `DELETE /api/v1/users/me` soft-deletes immediately; a scheduled worker handles hard purge
+- **GDPR Art. 20 — Data portability:** `GET /api/v1/users/me/export` allows users to download all their data (profile, posts, likes, follows) as a structured JSON file. For large accounts, this is handled asynchronously — the API queues the export and emails a download link via Postmark when ready.
+- **Android analytics consent:** the Termly cookie banner covers web/PWA only. The Android Capacitor app must display an in-app consent prompt on first launch before initialising Google Analytics. Consent state is persisted locally and checked before any analytics call.
 - Audit log entries for deletion requests
 
 ### OWASP Top 10 Checklist
 
 | # | Risk | Mitigation |
 |---|---|---|
-| A01 | Broken Access Control | Role-based checks on every endpoint; tests covering unauthorized access |
+| A01 | Broken Access Control | Role-based checks on every endpoint; tests covering unauthorized access; open redirect prevention on all `?redirect=` parameters; `frame-ancestors 'none'` + `X-Frame-Options: DENY` against clickjacking |
 | A02 | Cryptographic Failures | Firebase handles password hashing; HTTPS everywhere; no sensitive data in logs |
-| A03 | Injection | MongoDB typed query builders (no raw string queries); input validation; XSS sanitisation |
+| A03 | Injection | MongoDB typed query builders (no raw string queries); server-side HTML sanitisation on write (HtmlSanitizer); Angular auto-escaping + DOMPurify on render; CSP + Trusted Types in browser; Capacitor plugin allowlist |
 | A04 | Insecure Design | Threat modelling during design; security requirements in tickets |
 | A05 | Security Misconfiguration | Hardened defaults; no debug endpoints in production; secrets not in code |
-| A06 | Vulnerable Components | Automated dependency scanning in CI |
+| A06 | Vulnerable Components | Automated dependency scanning in CI; CodeQL + Semgrep SAST on every PR; Gitleaks secrets scanning |
 | A07 | Auth Failures | Firebase Auth handles brute-force, lockout, credential security; Zuplo rate limits our API; suspended users blocked at middleware |
 | A08 | Data Integrity Failures | Signed upload URLs; worker validates files before processing |
 | A09 | Logging Failures | Structured logs; security events logged; no sensitive data logged |
@@ -1135,11 +1489,14 @@ Additional privacy practices:
 - [x] ~~JWT (stateless) or server-side sessions~~ → Firebase ID tokens (JWTs) verified statelessly; no session storage needed
 
 ### Product Decisions
+- [ ] Hashtags (`#tags`) — extract on write, index for browse/feed; planned post-MVP
+- [ ] Link preview cards (OG metadata unfurling) — server-side URL fetch on post create, cached in Redis; requires URL allowlist to prevent SSRF (OWASP A10); planned post-MVP
 - [ ] What do we call a post? ("Brew"? "Pour"? just "post"?)
 - [ ] Character limit — 280 to match convention, or something distinct?
 - [ ] Private accounts in MVP or post-MVP?
 - [ ] Quote-post in MVP or post-MVP?
 - [ ] Should we support ActivityPub / Fediverse compatibility (long-term goal)?
+- [ ] Add Sign In with Apple (required by App Store before any iOS submission — Firebase Auth supports it)
 
 ### Infrastructure Decisions
 - [x] ~~Hosting provider~~ → DigitalOcean
@@ -1148,13 +1505,13 @@ Additional privacy practices:
 - [x] ~~Compliance & consent~~ → Termly
 - [ ] DigitalOcean App Platform vs. Kubernetes vs. raw Droplets for container orchestration? (decision can wait until after MVP is running)
 - [x] ~~Monitoring stack~~ → Sentry for errors/tracing; DigitalOcean native monitoring for infra metrics
-- [ ] Metrics dashboard: DigitalOcean native sufficient, or add Grafana?
+- [x] ~~Metrics dashboard~~ → Grafana Cloud free tier — unified logs (Loki), metrics (Prometheus), and dashboards in one platform
 - [x] ~~Email provider~~ → Postmark (transactional email)
 - [x] ~~Newsletter provider~~ → Beehiiv
 
 ### Operational Decisions
 - [ ] On-call rotation policy? (Who gets paged, and when?)
-- [ ] Public status page tooling? (Instatus, Betterstack, self-hosted?)
+- [x] ~~Public status page tooling~~ → UptimeRobot free hosted status page at status.coffeepotsocial.com
 - [ ] Backup testing cadence?
 
 ---

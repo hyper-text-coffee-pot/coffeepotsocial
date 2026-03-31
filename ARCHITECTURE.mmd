@@ -42,11 +42,16 @@ flowchart TB
         Postmark["Postmark\nTransactional email"]
         Beehiiv["Beehiiv\nNewsletter subscriber sync"]
         Termly["Termly\nCookie consent · Privacy policy · ToS"]
+        Grafana["Grafana + DO Monitoring\nMetrics dashboards\nPrometheus-compatible"]
+    end
+
+    subgraph RealTime["Real-Time (post-MVP)"]
+        SSE["SSE / WebSocket Server\nNotification push · Feed updates\nReplaces polling"]
     end
 
     subgraph DevOps["CI/CD & Infrastructure"]
         GitHub["GitHub\nSource control"]
-        GHActions["GitHub Actions\nLint · Test · Build · Deploy"]
+        GHActions["GitHub Actions\nLint · Test · Build · Deploy\nCodeQL · Semgrep · Gitleaks"]
         Terraform["Terraform\nIaC — all cloud resources"]
     end
 
@@ -67,7 +72,7 @@ flowchart TB
 
     %% ── Auth ──────────────────────────────────────────────────────
     ASPNET <-->|Validate Firebase ID tokens| FirebaseAuth
-    Web & Android <-->|Sign-in · OAuth flows| FirebaseAuth
+    Web & Android & Admin <-->|Sign-in · OAuth flows| FirebaseAuth
 
     %% ── Direct media upload (bypass API) ──────────────────────────
     Web & Android -->|Presigned PUT upload| R2
@@ -79,9 +84,12 @@ flowchart TB
     FCM -->|Push notification| Android & Web
     NewsletterWorker <-->|Mark synced| Mongo
     NewsletterWorker -->|POST subscriber| Beehiiv
+    CleanupWorker <-->|Find expired media| Mongo
+    CleanupWorker -->|Delete orphaned objects| R2
 
     %% ── Observability ─────────────────────────────────────────────
     ASPNET -->|Errors · traces · performance| Sentry
+    ASPNET -->|Prometheus metrics| Grafana
 
     %% ── Transactional email ───────────────────────────────────────
     ASPNET -->|Send email| Postmark
@@ -92,6 +100,10 @@ flowchart TB
     %% ── Compliance widgets ────────────────────────────────────────
     Termly -.->|Consent banner embedded| Web
     Termly -.->|Consent banner embedded| Admin
+
+    %% ── Real-time upgrade path (post-MVP) ────────────────────────
+    ASPNET -.->|"post-MVP: SSE / WebSocket"| SSE
+    SSE -.->|"post-MVP: push to clients"| Web & Android
 
     %% ── CI/CD pipeline ────────────────────────────────────────────
     GitHub -->|Triggers| GHActions
